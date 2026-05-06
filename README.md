@@ -11,6 +11,7 @@ Rust-backed Quran recitation transcription and ayah alignment.
 - Supports batch job transcription over HTTP.
 - Supports experimental low-latency streaming over WebSockets.
 - Keeps generated audio jobs, Hugging Face caches, and model files out of git.
+- Automatically cleans old `/data/jobs` artifacts with configurable retention.
 
 ## Repository Layout
 
@@ -87,6 +88,18 @@ curl -X POST http://127.0.0.1:8001/v1/sessions \
 ```
 
 The streaming WebSocket accepts binary PCM16LE mono audio at 16 kHz.
+
+## Job Cleanup
+
+The Rust API periodically deletes old job artifact directories from `/data/jobs`.
+
+- `JOB_CLEANUP_ENABLED=true` enables the cleanup loop.
+- `JOB_RETENTION_S=86400` keeps completed or failed jobs for 24 hours by default.
+- `JOB_CLEANUP_INTERVAL_S=3600` runs cleanup hourly after startup.
+- `JOB_CLEANUP_STARTUP=true` also runs one cleanup pass when the API boots.
+- `JOB_CLEANUP_MAX_DELETE_PER_RUN=200` caps deletes per pass so cleanup cannot monopolize disk I/O.
+
+Queued and running jobs tracked by the API are never deleted. Job directories left over from previous API runs are cleaned by directory modification time.
 
 ## Model Credits
 

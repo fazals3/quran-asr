@@ -15,6 +15,8 @@ The services communicate over the Docker Compose network. Uploaded files and gen
 4. Rust runs Quran guessing and v2 alignment in parallel blocking tasks.
 5. Rust writes `result.json` and returns it from `GET /v1/jobs/:job_id`.
 
+Completed and failed job directories are retained for `JOB_RETENTION_S`, then removed by a background cleanup task. At startup, the same cleanup also removes stale job directories left behind by previous API runs.
+
 ## Streaming Flow
 
 1. Client creates a session with `POST /v1/sessions`.

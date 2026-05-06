@@ -1,4 +1,5 @@
 mod alignment_v2;
+mod cleanup;
 mod config;
 mod guessing;
 mod multispan;
@@ -24,6 +25,7 @@ use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, Validation};
 use reqwest::multipart::{Form, Part};
@@ -41,6 +43,7 @@ use crate::config::{env_f64_opt, load_settings, Settings};
 use crate::state::{
     job_input_path, job_request_path, job_result_path, now_ts, AppState, JobMeta,
 };
+use crate::transcriber_pool::TranscriberPool;
 
 #[derive(Debug, Deserialize)]
 struct StreamJwtClaims {
@@ -776,6 +779,7 @@ async fn create_job(
                 file_saved = Some((input_path, size_bytes, filename, content_type));
             }
             Err(e) => {
+                cleanup::remove_job_dir_for_upload_failure(&state, &job_id).await;
                 return json_resp(
                     StatusCode::BAD_GATEWAY,
                     json!({"error": format!("source_url download failed: {e}")}),
@@ -802,6 +806,7 @@ async fn create_job(
                     file_saved = Some((input_path, size_bytes, filename2, content_type));
                 }
                 Err(e) => {
+                    cleanup::remove_job_dir_for_upload_failure(&state, &job_id).await;
                     return json_resp(
                         StatusCode::BAD_REQUEST,
                         json!({"error": format!("upload failed: {}", e)}),
@@ -813,6 +818,7 @@ async fn create_job(
     }
 
     let Some((input_path, size_bytes, filename, content_type)) = file_saved else {
+        cleanup::remove_job_dir_for_upload_failure(&state, &job_id).await;
         return json_resp(StatusCode::BAD_REQUEST, json!({"error":"missing file"}));
     };
 
@@ -863,6 +869,8 @@ async fn create_job(
     state.jobs.insert(job_id.clone(), meta);
 
     if let Err(_e) = state.queue_tx.try_send(job_id.clone()) {
+        state.jobs.remove(&job_id);
+        cleanup::remove_job_dir_for_upload_failure(&state, &job_id).await;
         return json_resp(StatusCode::SERVICE_UNAVAILABLE, json!({"error":"queue full"}));
     }
 
@@ -957,7 +965,7 @@ async fn process_job(job_id: &str, state: &AppState) -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or(&meta.filename)
         .to_string();
-    let content_type = input
+    let _content_type = input
         .get("content_type")
         .and_then(|v| v.as_str())
         .unwrap_or(&meta.content_type)
@@ -1304,6 +1312,7 @@ async fn main() -> anyhow::Result<()> {
     for wid in 0..workers {
         tokio::spawn(worker_loop(rx.clone(), state.clone(), wid));
     }
+    cleanup::spawn_job_cleanup(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
