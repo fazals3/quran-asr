@@ -24,6 +24,20 @@ Completed and failed job directories are retained for `JOB_RETENTION_S`, then re
 3. Client sends PCM16LE mono 16 kHz frames.
 4. Rust buffers windows, calls the transcriber, aligns each window, and emits `ayah_update` events.
 
+## Demo Mode
+
+When `DEMO_ENABLED=true`, the Rust API mounts a `/demo/*` route namespace with:
+
+- `POST /demo/v1/transcribe` — upload and transcribe (no API key, rate limited per IP).
+- `POST /demo/v1/sessions` — create a streaming session.
+- `GET /demo/v1/sessions/:id/stream` — WebSocket (no auth).
+- `POST /demo/v1/sessions/:id/stop` — stop a session.
+- `GET /demo/v1/jobs/:id` — poll job result.
+
+These endpoints use the same job queue and streaming infrastructure as the authenticated API. CORS headers are applied so the demo frontend (a standalone React app in `demo/`) can connect from any origin.
+
+Rate limiting is in-memory, per-IP, sliding window (configurable via `DEMO_RATE_LIMIT_PER_MIN`). Upload size and audio duration are capped separately from the main API (`DEMO_MAX_UPLOAD_BYTES`, `DEMO_MAX_AUDIO_DURATION_S`).
+
 ## Local Runtime Data
 
 The repo tracks only small source data. Runtime data is local:

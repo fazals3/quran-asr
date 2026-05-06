@@ -1,6 +1,7 @@
 mod alignment_v2;
 mod cleanup;
 mod config;
+mod demo;
 mod guessing;
 mod multispan;
 mod npy;
@@ -54,7 +55,7 @@ struct StreamJwtClaims {
     exp: u64,
 }
 
-async fn write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
+pub async fn write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -63,7 +64,7 @@ async fn write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_json(path: &Path) -> anyhow::Result<Value> {
+pub async fn read_json(path: &Path) -> anyhow::Result<Value> {
     let bytes = tokio::fs::read(path).await?;
     let v: Value = serde_json::from_slice(&bytes)?;
     Ok(v)
@@ -128,7 +129,7 @@ fn require_internal_streaming_test(
     Ok(())
 }
 
-fn json_resp(code: StatusCode, v: Value) -> Response {
+pub fn json_resp(code: StatusCode, v: Value) -> Response {
     (code, Json(v)).into_response()
 }
 
@@ -222,7 +223,7 @@ struct CreateStreamSessionBody {
     min_process_s: Option<f64>,
 }
 
-async fn safe_stream_copy_to_path(
+pub async fn safe_stream_copy_to_path(
     mut field: axum::extract::multipart::Field<'_>,
     dst_path: &Path,
     max_bytes: usize,
@@ -946,7 +947,7 @@ async fn get_job_status(
     json_resp(StatusCode::OK, payload)
 }
 
-async fn process_job(job_id: &str, state: &AppState) -> anyhow::Result<()> {
+pub async fn process_job(job_id: &str, state: &AppState) -> anyhow::Result<()> {
     let Some(mut meta) = state.jobs.get(job_id).map(|m| m.clone()) else {
         anyhow::bail!("job not found");
     };
@@ -1314,7 +1315,7 @@ async fn main() -> anyhow::Result<()> {
     }
     cleanup::spawn_job_cleanup(state.clone());
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/jobs/transcribe", post(create_job))
         .route("/v1/jobs/:job_id", get(get_job_status))
@@ -1325,9 +1326,36 @@ async fn main() -> anyhow::Result<()> {
         .route("/internal/streaming_session", post(internal_create_stream_session))
         .route("/internal/sessions/:session_id/stop", post(internal_stop_stream_session))
         .route("/internal/quran/ayah", get(internal_quran_ayah_lookup))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(settings.max_upload_bytes))
         .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    if settings.demo_enabled {
+        info!("demo mode enabled — mounting /demo/* routes");
+        let demo_cors = {
+            use tower_http::cors::{CorsLayer, Any};
+            use axum::http::{Method, header};
+            let origins = &settings.demo_allowed_origins;
+            let layer = if origins.iter().any(|o| o == "*") {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            } else {
+                let allowed: Vec<_> = origins
+                    .iter()
+                    .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
+                    .collect();
+                CorsLayer::new()
+                    .allow_origin(allowed)
+                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            };
+            layer
+        };
+        let demo = demo::demo_router(state.clone()).layer(demo_cors);
+        app = app.nest("/demo", demo);
+    }
 
     let addr: SocketAddr = "0.0.0.0:8001".parse().unwrap();
     info!("listening on {}", addr);

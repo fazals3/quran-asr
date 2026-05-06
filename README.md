@@ -18,6 +18,7 @@ Rust-backed Quran recitation transcription and ayah alignment.
 ```text
 api/              Rust API, alignment, guessing, streaming, and job processing
 transcriber/      Python FastAPI ASR service
+demo/             Standalone web demo frontend (React + Vite)
 tools/            Local simulation, A/B comparison, and Quran DB build helpers
 data/             Quran source JSON plus local runtime data mount
 docs/             Additional operational notes
@@ -88,6 +89,33 @@ curl -X POST http://127.0.0.1:8001/v1/sessions \
 ```
 
 The streaming WebSocket accepts binary PCM16LE mono audio at 16 kHz.
+
+## Demo Mode
+
+An optional public demo UI (similar to Hugging Face Spaces) lets anyone try the system without an API key. It supports file upload, in-browser recording, and real-time streaming — all capped at 1 minute of audio.
+
+Demo mode is **off by default**. To enable:
+
+```bash
+# In .env
+DEMO_ENABLED=true
+```
+
+This mounts `/demo/*` endpoints on the API with CORS and per-IP rate limiting. The frontend is a standalone React app in `demo/` that can run on a separate machine from the API.
+
+Quick start:
+
+```bash
+docker compose -f docker-compose.demo.yml up -d --build
+```
+
+Or run the frontend locally for development:
+
+```bash
+cd demo && npm install && npm run dev
+```
+
+See `docs/demo.md` for a full walkthrough.
 
 ## Job Cleanup
 

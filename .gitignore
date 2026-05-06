@@ -11,6 +11,9 @@ __pycache__/
 target/
 api/target/
 
+demo/node_modules/
+demo/dist/
+
 data/hf/
 data/jobs/
 data/tmp/

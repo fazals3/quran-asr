@@ -1083,6 +1083,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "quran-asr-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blake2",
+ "bytes",
+ "dashmap",
+ "futures-util",
+ "half",
+ "ipnet",
+ "jsonwebtoken",
+ "lru",
+ "memmap2",
+ "rayon",
+ "reqwest",
+ "rusqlite",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-general-category",
+ "uuid",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1261,36 +1291,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
-]
-
-[[package]]
-name = "quran-asr-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "blake2",
- "bytes",
- "dashmap",
- "futures-util",
- "half",
- "ipnet",
- "jsonwebtoken",
- "lru",
- "memmap2",
- "rayon",
- "reqwest",
- "rusqlite",
- "rustc-hash",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "unicode-general-category",
- "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,69 @@
+name: quran-asr-demo
+
+services:
+  transcriber:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data:/data
+    gpus: all
+    expose:
+      - "9000"
+
+  transcriber2:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data:/data
+    gpus: all
+    expose:
+      - "9000"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TRANSCRIBER_URL: http://transcriber:9000
+      TRANSCRIBER_URLS: http://transcriber:9000,http://transcriber2:9000
+      DATA_DIR: /data
+      DEMO_ENABLED: "true"
+    depends_on:
+      - transcriber
+      - transcriber2
+    volumes:
+      - ./data:/data
+      - ./data/alignment/v2:/data/alignment/v2:ro
+      - ./data/quran.db:/data/quran.db:ro
+    ports:
+      - "${TAILSCALE_IP:-127.0.0.1}:${RUST_API_PORT:-8001}:8001"
+      - "127.0.0.1:${RUST_API_LOCAL_PORT:-8004}:8001"
+
+  demo-frontend:
+    build:
+      context: ./demo
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:3000"
+    environment:
+      VITE_API_URL: "http://localhost:8001"

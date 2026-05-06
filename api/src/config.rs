@@ -37,6 +37,12 @@ pub struct Settings {
     pub guess_rank_mode: String,
     pub guess_max_query_tokens: usize,
     pub guess_max_hits: usize,
+
+    pub demo_enabled: bool,
+    pub demo_allowed_origins: Vec<String>,
+    pub demo_max_audio_duration_s: f64,
+    pub demo_max_upload_bytes: usize,
+    pub demo_rate_limit_per_min: usize,
 }
 
 pub fn env(name: &str, default: &str) -> String {
@@ -148,5 +154,11 @@ pub fn load_settings() -> Settings {
         guess_rank_mode: env("GUESS_RANK_MODE", "sum_top_score"),
         guess_max_query_tokens: env_usize("GUESS_MAX_QUERY_TOKENS", 24),
         guess_max_hits: env_usize("GUESS_MAX_HITS", 800),
+
+        demo_enabled: env_bool("DEMO_ENABLED", false),
+        demo_allowed_origins: parse_csv_hosts(&env("DEMO_ALLOWED_ORIGINS", "*")),
+        demo_max_audio_duration_s: env_f64_opt("DEMO_MAX_AUDIO_DURATION_S", Some(60.0)).unwrap_or(60.0),
+        demo_max_upload_bytes: env_usize("DEMO_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
+        demo_rate_limit_per_min: env_usize("DEMO_RATE_LIMIT_PER_MIN", 10),
     }
 }
