@@ -1,0 +1,59 @@
+name: quran-asr-dev
+
+services:
+  transcriber:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data-dev:/data
+    gpus: all
+    # Internal-only (Rust API talks to it over the compose network).
+    expose:
+      - "9000"
+
+  # Extra transcriber instance for higher throughput on a single GPU.
+  # Each instance loads the model, so keep the count conservative on 8GB VRAM.
+  transcriber2:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data-dev:/data
+    gpus: all
+    expose:
+      - "9000"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      TRANSCRIBER_URLS: http://transcriber:9000,http://transcriber2:9000
+      DATA_DIR: /data
+    depends_on:
+      - transcriber
+      - transcriber2
+    volumes:
+      - ./data-dev:/data
+      - ./data/alignment/v2:/data/alignment/v2:ro
+      - ./data/quran.db:/data/quran.db:ro
+    ports:
+      - "${TAILSCALE_IP:-127.0.0.1}:8002:8001"

@@ -1,0 +1,16 @@
+[
+  {
+    "label": "78 (head)",
+    "audio": "outputs/alafasy_001-114_20251231_222720/audio/078.mp3",
+    "start_s": 0.0,
+    "max_s": 18.0
+  },
+  { "label": "gap", "silence_s": 0.5 },
+  {
+    "label": "105 (head)",
+    "audio": "outputs/alafasy_001-114_20251231_222720/audio/105.mp3",
+    "start_s": 0.0,
+    "max_s": 18.0
+  }
+]
+

@@ -1,0 +1,60 @@
+services:
+  transcriber:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data:/data
+    gpus: all
+    # Internal-only (Rust API talks to it over the compose network).
+    expose:
+      - "9000"
+
+  # Optional extra transcriber instance for higher throughput on a single GPU.
+  # Each instance loads the model, so keep the count conservative on 8GB VRAM.
+  transcriber2:
+    build:
+      context: .
+      dockerfile: transcriber/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /data/hf
+      DATA_DIR: /data
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ./data:/data
+    gpus: all
+    expose:
+      - "9000"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TRANSCRIBER_URL: http://transcriber:9000
+      TRANSCRIBER_URLS: http://transcriber:9000,http://transcriber2:9000
+      DATA_DIR: /data
+    depends_on:
+      - transcriber
+      - transcriber2
+    volumes:
+      - ./data:/data
+      - ./data/alignment/v2:/data/alignment/v2:ro
+      - ./data/quran.db:/data/quran.db:ro
+    ports:
+      - "${TAILSCALE_IP:-127.0.0.1}:${RUST_API_PORT:-8001}:8001"
+      # Local loopback port for Cloudflare Tunnel (keeps Tailnet binding separate).
+      - "127.0.0.1:${RUST_API_LOCAL_PORT:-8004}:8001"
