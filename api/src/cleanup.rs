@@ -130,6 +130,35 @@ pub fn spawn_job_cleanup(state: AppState) {
     });
 }
 
+/// Periodically drop stream sessions that have stopped, so the `stream_sessions`
+/// map (and the per-session ring buffers / background tasks) don't accumulate
+/// indefinitely. A session becomes reapable once `stop_requested` is set, which
+/// happens on client disconnect, explicit stop, or any watchdog timeout.
+pub fn spawn_session_reaper(state: AppState) {
+    let interval_s = (crate::config::env_f64_opt("STREAM_SESSION_REAPER_INTERVAL_S", Some(10.0))
+        .unwrap_or(10.0)
+        .max(1.0)) as u64;
+
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(interval_s)).await;
+            let before = state.stream_sessions.len();
+            // Atomic load only inside the closure — no async work, no `.remove()`.
+            state
+                .stream_sessions
+                .retain(|_id, s| !s.stop_requested());
+            let removed = before.saturating_sub(state.stream_sessions.len());
+            if removed > 0 {
+                info!(
+                    removed,
+                    remaining = state.stream_sessions.len(),
+                    "stream session reaper collected stopped sessions"
+                );
+            }
+        }
+    });
+}
+
 pub async fn remove_job_dir_for_upload_failure(state: &AppState, job_id: &str) {
     let path = job_dir(&state.settings.data_dir, job_id);
     let _ = tokio::fs::remove_dir_all(path).await;

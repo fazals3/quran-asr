@@ -181,6 +181,10 @@ pub struct StreamSession {
     total_pcm_bytes: AtomicU64,
     last_processed_pcm_bytes: AtomicU64,
     stop_requested: AtomicBool,
+    created_unix_ms: u64,
+    ws_connected: AtomicBool,
+    connect_timeout_s: f64,
+    max_audio_s: Option<f64>,
     notify: Notify,
     pub out_tx: broadcast::Sender<String>,
     stability: Mutex<StabilityState>,
@@ -226,6 +230,8 @@ impl StreamSession {
         silence_stop_after_s: f64,
         tail_context_s: f64,
         full_refresh_every_s: f64,
+        connect_timeout_s: f64,
+        max_audio_s: Option<f64>,
     ) -> Arc<Self> {
         let (out_tx, _out_rx) = broadcast::channel::<String>(256);
         let bytes_per_s = (cfg.sample_rate_hz as usize)
@@ -241,6 +247,10 @@ impl StreamSession {
             total_pcm_bytes: AtomicU64::new(0),
             last_processed_pcm_bytes: AtomicU64::new(0),
             stop_requested: AtomicBool::new(false),
+            created_unix_ms: now_unix_ms(),
+            ws_connected: AtomicBool::new(false),
+            connect_timeout_s: connect_timeout_s.max(0.0),
+            max_audio_s,
             notify: Notify::new(),
             out_tx,
             stability: Mutex::new(StabilityState::default()),
@@ -289,6 +299,10 @@ impl StreamSession {
         self.notify.notify_waiters();
     }
 
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
     pub fn set_auth_expiry_unix_s(&self, exp: u64) {
         self.auth_expires_unix_s.store(exp, Ordering::Relaxed);
     }
@@ -327,6 +341,7 @@ impl StreamSession {
     }
 
     pub async fn handle_ws(&self, socket: axum::extract::ws::WebSocket) {
+        self.ws_connected.store(true, Ordering::Relaxed);
         let (mut ws_tx, mut ws_rx) = socket.split();
 
         let mut out_rx = self.out_tx.subscribe();
@@ -395,6 +410,10 @@ impl StreamSession {
             }
         }
 
+        // Client disconnected (close frame or socket end). Signal the loops to wind
+        // down so the session becomes reapable promptly instead of lingering until a
+        // no-audio/silence timeout fires. There is no reconnect-to-same-session flow.
+        self.request_stop();
         forwarder.abort();
     }
 
@@ -995,10 +1014,59 @@ impl StreamSession {
 
     async fn watchdog_loop(&self) {
         let tick = std::time::Duration::from_millis(250);
+        let bytes_per_s = (self.cfg.sample_rate_hz as u64)
+            .saturating_mul(self.cfg.channels as u64)
+            .saturating_mul(2)
+            .max(1);
         loop {
             tokio::time::sleep(tick).await;
             if self.stop_requested.load(Ordering::Relaxed) {
                 return;
+            }
+
+            // Reap sessions whose client never connected the WebSocket. Without this,
+            // an orphaned session never satisfies any other timeout (all gated on audio
+            // or auth activity) and would loop forever.
+            if !self.ws_connected.load(Ordering::Relaxed)
+                && self.connect_timeout_s.is_finite()
+                && self.connect_timeout_s > 0.0
+            {
+                let age_s = (now_unix_ms().saturating_sub(self.created_unix_ms)) as f64 / 1000.0;
+                if age_s >= self.connect_timeout_s {
+                    let _ = self.out_tx.send(
+                        json!({
+                            "type":"session_end",
+                            "reason":"connect_timeout",
+                            "session_id": self.id,
+                            "age_s": age_s,
+                        })
+                        .to_string(),
+                    );
+                    self.request_stop();
+                    return;
+                }
+            }
+
+            // Enforce a maximum amount of received audio (e.g. the demo duration cap).
+            if let Some(max_s) = self.max_audio_s {
+                if max_s.is_finite() && max_s > 0.0 {
+                    let dur_s =
+                        self.total_pcm_bytes.load(Ordering::Relaxed) as f64 / bytes_per_s as f64;
+                    if dur_s >= max_s {
+                        let _ = self.out_tx.send(
+                            json!({
+                                "type":"session_end",
+                                "reason":"max_duration",
+                                "session_id": self.id,
+                                "duration_s": dur_s,
+                                "max_s": max_s,
+                            })
+                            .to_string(),
+                        );
+                        self.request_stop();
+                        return;
+                    }
+                }
             }
 
             let now_s = now_unix_s();

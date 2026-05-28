@@ -50,7 +50,22 @@ pub fn job_dir(data_dir: &Path, job_id: &str) -> PathBuf {
 }
 
 pub fn job_input_path(data_dir: &Path, job_id: &str, filename: &str) -> PathBuf {
-    job_dir(data_dir, job_id).join("input").join(filename)
+    job_dir(data_dir, job_id)
+        .join("input")
+        .join(sanitize_upload_filename(filename))
+}
+
+/// Reduce an untrusted upload filename to a safe basename so it can never escape
+/// the job's `input/` directory (path traversal). Strips any directory components
+/// and rejects empty / `.` / `..` names, falling back to a default.
+pub fn sanitize_upload_filename(filename: &str) -> String {
+    Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .unwrap_or("upload.bin")
+        .to_string()
 }
 
 pub fn job_request_path(data_dir: &Path, job_id: &str) -> PathBuf {
@@ -59,4 +74,38 @@ pub fn job_request_path(data_dir: &Path, job_id: &str) -> PathBuf {
 
 pub fn job_result_path(data_dir: &Path, job_id: &str) -> PathBuf {
     job_dir(data_dir, job_id).join("result.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_plain_names() {
+        assert_eq!(sanitize_upload_filename("recitation.m4a"), "recitation.m4a");
+        assert_eq!(sanitize_upload_filename("  spaced.wav  "), "spaced.wav");
+    }
+
+    #[test]
+    fn sanitize_strips_traversal() {
+        assert_eq!(sanitize_upload_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_upload_filename("/abs/path/foo.mp3"), "foo.mp3");
+        assert_eq!(sanitize_upload_filename("a/b/c.ogg"), "c.ogg");
+    }
+
+    #[test]
+    fn sanitize_falls_back_on_dangerous_or_empty() {
+        for bad in ["", "..", ".", "/", "../", "   "] {
+            assert_eq!(sanitize_upload_filename(bad), "upload.bin", "input: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn job_input_path_stays_within_job_dir() {
+        let data_dir = Path::new("/data");
+        let p = job_input_path(data_dir, "job123", "../../escape.m4a");
+        assert_eq!(p, Path::new("/data/jobs/job123/input/escape.m4a"));
+        // No `..` components survive into the constructed path.
+        assert!(!p.components().any(|c| c.as_os_str() == ".."));
+    }
 }

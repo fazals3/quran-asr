@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{env_f64_opt, load_settings, Settings};
@@ -214,13 +214,74 @@ struct TranscribeQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct CreateStreamSessionBody {
-    sample_rate_hz: Option<u32>,
-    channels: Option<u16>,
-    window_s: Option<f64>,
-    hop_s: Option<f64>,
-    buffer_s: Option<f64>,
-    min_process_s: Option<f64>,
+pub(crate) struct CreateStreamSessionBody {
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u16>,
+    pub window_s: Option<f64>,
+    pub hop_s: Option<f64>,
+    pub buffer_s: Option<f64>,
+    pub min_process_s: Option<f64>,
+}
+
+/// Build a `StreamConfig` from request overrides, validate it, spawn the streaming
+/// session (wiring every `STREAM_*` env knob plus the connect-timeout and optional
+/// max-audio cap once), and register it in `stream_sessions`. Shared by the public,
+/// internal, and demo session-creation handlers so the lifecycle params stay in sync.
+/// Returns `Err(message)` only for invalid stream config.
+pub(crate) fn spawn_and_register_stream_session(
+    state: &AppState,
+    assets: Arc<alignment_v2::AlignmentAssetsV2>,
+    body: &CreateStreamSessionBody,
+    max_audio_s: Option<f64>,
+) -> Result<(String, streaming::StreamConfig, Arc<streaming::StreamSession>), String> {
+    let mut cfg = streaming::StreamConfig::default();
+    if let Some(v) = body.sample_rate_hz {
+        cfg.sample_rate_hz = v;
+    }
+    if let Some(v) = body.channels {
+        cfg.channels = v;
+    }
+    if let Some(v) = body.window_s {
+        cfg.window_s = v;
+    }
+    if let Some(v) = body.hop_s {
+        cfg.hop_s = v;
+    }
+    if let Some(v) = body.buffer_s {
+        cfg.buffer_s = v;
+    }
+    if let Some(v) = body.min_process_s {
+        cfg.min_process_s = v;
+    }
+    let cfg = streaming::validate_stream_cfg(cfg).map_err(|e| e.to_string())?;
+
+    let session_id = Uuid::new_v4().simple().to_string();
+    let session = streaming::StreamSession::spawn(
+        session_id.clone(),
+        cfg.clone(),
+        state.settings.data_dir.clone(),
+        state.http.clone(),
+        state.settings.api_key.clone(),
+        state.transcriber_pool.clone(),
+        state.transcribe_sem.clone(),
+        assets,
+        state.settings.ayah_word_time_upgrade.clone(),
+        state.settings.stream_jwt_secret.clone(),
+        state.settings.stream_jwt_audience.clone(),
+        state.settings.stream_auth_grace_s,
+        env_f64_opt("STREAM_NO_AUDIO_TIMEOUT_S", Some(30.0)).unwrap_or(30.0),
+        env_f64_opt("STREAM_SILENCE_DBFS_THRESHOLD", Some(-45.0)).unwrap_or(-45.0),
+        env_f64_opt("STREAM_SILENCE_SKIP_AFTER_S", Some(1.2)).unwrap_or(1.2),
+        env_f64_opt("STREAM_SILENCE_TIMEOUT_S", Some(60.0)).unwrap_or(60.0),
+        env_f64_opt("STREAM_TAIL_CONTEXT_S", Some(4.0)).unwrap_or(4.0),
+        env_f64_opt("STREAM_FULL_REFRESH_EVERY_S", Some(60.0)).unwrap_or(60.0),
+        env_f64_opt("STREAM_CONNECT_TIMEOUT_S", Some(30.0)).unwrap_or(30.0),
+        max_audio_s,
+    );
+    state
+        .stream_sessions
+        .insert(session_id.clone(), session.clone());
+    Ok((session_id, cfg, session))
 }
 
 pub async fn safe_stream_copy_to_path(
@@ -285,54 +346,11 @@ async fn create_stream_session(
         }
     };
 
-    let mut cfg = streaming::StreamConfig::default();
-    if let Some(v) = body.sample_rate_hz {
-        cfg.sample_rate_hz = v;
-    }
-    if let Some(v) = body.channels {
-        cfg.channels = v;
-    }
-    if let Some(v) = body.window_s {
-        cfg.window_s = v;
-    }
-    if let Some(v) = body.hop_s {
-        cfg.hop_s = v;
-    }
-    if let Some(v) = body.buffer_s {
-        cfg.buffer_s = v;
-    }
-    if let Some(v) = body.min_process_s {
-        cfg.min_process_s = v;
-    }
-    let cfg = match streaming::validate_stream_cfg(cfg) {
-        Ok(c) => c,
-        Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
-    };
-
-    let session_id = Uuid::new_v4().simple().to_string();
-    let session = streaming::StreamSession::spawn(
-        session_id.clone(),
-        cfg.clone(),
-        state.settings.data_dir.clone(),
-        state.http.clone(),
-        state.settings.api_key.clone(),
-        state.transcriber_pool.clone(),
-        state.transcribe_sem.clone(),
-        assets,
-        state.settings.ayah_word_time_upgrade.clone(),
-        state.settings.stream_jwt_secret.clone(),
-        state.settings.stream_jwt_audience.clone(),
-        state.settings.stream_auth_grace_s,
-        env_f64_opt("STREAM_NO_AUDIO_TIMEOUT_S", Some(30.0)).unwrap_or(30.0),
-        env_f64_opt("STREAM_SILENCE_DBFS_THRESHOLD", Some(-45.0)).unwrap_or(-45.0),
-        env_f64_opt("STREAM_SILENCE_SKIP_AFTER_S", Some(1.2)).unwrap_or(1.2),
-        env_f64_opt("STREAM_SILENCE_TIMEOUT_S", Some(60.0)).unwrap_or(60.0),
-        env_f64_opt("STREAM_TAIL_CONTEXT_S", Some(4.0)).unwrap_or(4.0),
-        env_f64_opt("STREAM_FULL_REFRESH_EVERY_S", Some(60.0)).unwrap_or(60.0),
-    );
-    state
-        .stream_sessions
-        .insert(session_id.clone(), session.clone());
+    let (session_id, cfg, session) =
+        match spawn_and_register_stream_session(&state, assets, &body, None) {
+            Ok(v) => v,
+            Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e})),
+        };
 
     let ws_path = session.ws_path();
     let ws_url = headers
@@ -431,54 +449,11 @@ async fn internal_create_stream_session(
         );
     };
 
-    let mut cfg = streaming::StreamConfig::default();
-    if let Some(v) = body.sample_rate_hz {
-        cfg.sample_rate_hz = v;
-    }
-    if let Some(v) = body.channels {
-        cfg.channels = v;
-    }
-    if let Some(v) = body.window_s {
-        cfg.window_s = v;
-    }
-    if let Some(v) = body.hop_s {
-        cfg.hop_s = v;
-    }
-    if let Some(v) = body.buffer_s {
-        cfg.buffer_s = v;
-    }
-    if let Some(v) = body.min_process_s {
-        cfg.min_process_s = v;
-    }
-    let cfg = match streaming::validate_stream_cfg(cfg) {
-        Ok(c) => c,
-        Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
-    };
-
-    let session_id = Uuid::new_v4().simple().to_string();
-    let session = streaming::StreamSession::spawn(
-        session_id.clone(),
-        cfg.clone(),
-        state.settings.data_dir.clone(),
-        state.http.clone(),
-        state.settings.api_key.clone(),
-        state.transcriber_pool.clone(),
-        state.transcribe_sem.clone(),
-        assets,
-        state.settings.ayah_word_time_upgrade.clone(),
-        state.settings.stream_jwt_secret.clone(),
-        state.settings.stream_jwt_audience.clone(),
-        state.settings.stream_auth_grace_s,
-        env_f64_opt("STREAM_NO_AUDIO_TIMEOUT_S", Some(30.0)).unwrap_or(30.0),
-        env_f64_opt("STREAM_SILENCE_DBFS_THRESHOLD", Some(-45.0)).unwrap_or(-45.0),
-        env_f64_opt("STREAM_SILENCE_SKIP_AFTER_S", Some(1.2)).unwrap_or(1.2),
-        env_f64_opt("STREAM_SILENCE_TIMEOUT_S", Some(60.0)).unwrap_or(60.0),
-        env_f64_opt("STREAM_TAIL_CONTEXT_S", Some(4.0)).unwrap_or(4.0),
-        env_f64_opt("STREAM_FULL_REFRESH_EVERY_S", Some(60.0)).unwrap_or(60.0),
-    );
-    state
-        .stream_sessions
-        .insert(session_id.clone(), session.clone());
+    let (session_id, cfg, session) =
+        match spawn_and_register_stream_session(&state, assets, &body, None) {
+            Ok(v) => v,
+            Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e})),
+        };
 
     let ws_path = session.ws_path();
     let ws_url = headers
@@ -1255,6 +1230,35 @@ async fn worker_loop(rx: Arc<Mutex<mpsc::Receiver<String>>>, state: AppState, wo
     }
 }
 
+/// Best-effort, non-fatal startup checks that surface common misconfigurations
+/// (missing Quran DB, unreachable transcriber) with clear log messages up front,
+/// instead of failing opaquely on the first request.
+async fn startup_diagnostics(state: &AppState) {
+    if !state.settings.quran_db_path.exists() {
+        warn!(
+            path = %state.settings.quran_db_path.display(),
+            "Quran DB not found — surah guessing and ayah lookup will fail until it is built (see tools/build_quran_db.py)"
+        );
+    }
+
+    for url in state.transcriber_pool.urls() {
+        let health_url = format!("{}/health", url.trim_end_matches('/'));
+        let mut req = state.http.get(&health_url).timeout(Duration::from_secs(3));
+        if !state.settings.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", state.settings.api_key));
+        }
+        match req.send().await {
+            // Any HTTP response (even 401/403) means the service is up; we only warn
+            // when we cannot connect at all.
+            Ok(resp) => info!(url = %url, status = resp.status().as_u16(), "transcriber reachable at startup"),
+            Err(e) => warn!(
+                url = %url,
+                "transcriber not reachable at startup ({e}) — it may still be starting or loading the model"
+            ),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1314,6 +1318,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(worker_loop(rx.clone(), state.clone(), wid));
     }
     cleanup::spawn_job_cleanup(state.clone());
+    cleanup::spawn_session_reaper(state.clone());
+
+    startup_diagnostics(&state).await;
 
     let mut app = Router::new()
         .route("/health", get(health))

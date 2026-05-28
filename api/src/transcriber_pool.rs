@@ -39,6 +39,10 @@ impl TranscriberPool {
         }
     }
 
+    pub fn urls(&self) -> &[String] {
+        self.urls.as_slice()
+    }
+
     pub fn pick(&self) -> TranscriberLease {
         let n = self.urls.len();
         if n == 0 {

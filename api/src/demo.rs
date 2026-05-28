@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,15 +18,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::state::{AppState, JobMeta, job_input_path, job_request_path, job_result_path, now_ts};
-use crate::streaming;
-use crate::{json_resp, safe_stream_copy_to_path, write_json, read_json};
+use crate::{json_resp, safe_stream_copy_to_path, write_json, read_json, CreateStreamSessionBody};
 use crate::cleanup;
-use crate::config::env_f64_opt;
 
 #[derive(Clone)]
 pub struct DemoRateLimiter {
     inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     max_per_min: usize,
+    sweep_counter: Arc<AtomicUsize>,
 }
 
 impl DemoRateLimiter {
@@ -33,20 +33,37 @@ impl DemoRateLimiter {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             max_per_min,
+            sweep_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub async fn check(&self, key: &str) -> bool {
-        let mut map = self.inner.lock().await;
+    /// Returns `Ok(())` if the request is allowed, or `Err(retry_after_s)` with a hint
+    /// (seconds until a slot frees up) when the per-minute limit is exceeded.
+    pub async fn check(&self, key: &str) -> Result<(), u64> {
         let now = Instant::now();
         let cutoff = now - Duration::from_secs(60);
+        let mut map = self.inner.lock().await;
+
+        // Amortized sweep so keys for IPs that stopped sending requests don't pile up;
+        // keeps the map proportional to recently-active clients rather than all-time IPs.
+        if self.sweep_counter.fetch_add(1, Ordering::Relaxed) % 512 == 0 {
+            map.retain(|_k, times| {
+                times.retain(|t| *t > cutoff);
+                !times.is_empty()
+            });
+        }
+
         let entry = map.entry(key.to_string()).or_default();
         entry.retain(|t| *t > cutoff);
         if entry.len() >= self.max_per_min {
-            return false;
+            let oldest = entry.first().copied().unwrap_or(now);
+            let retry = 60u64
+                .saturating_sub(now.duration_since(oldest).as_secs())
+                .max(1);
+            return Err(retry);
         }
         entry.push(now);
-        true
+        Ok(())
     }
 }
 
@@ -66,26 +83,16 @@ struct DemoTranscribeQuery {
     wait_timeout_s: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct DemoCreateStreamBody {
-    sample_rate_hz: Option<u32>,
-    channels: Option<u16>,
-    window_s: Option<f64>,
-    hop_s: Option<f64>,
-    buffer_s: Option<f64>,
-    min_process_s: Option<f64>,
-}
-
 async fn demo_transcribe(
     State(state): State<DemoState>,
     Query(q): Query<DemoTranscribeQuery>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    if !state.rate_limiter.check(&client_key(&addr)).await {
+    if let Err(retry_after_s) = state.rate_limiter.check(&client_key(&addr)).await {
         return json_resp(
             StatusCode::TOO_MANY_REQUESTS,
-            json!({"error": "rate limit exceeded, try again later"}),
+            json!({"error": "rate limit exceeded, try again later", "retry_after_s": retry_after_s}),
         );
     }
 
@@ -248,10 +255,10 @@ async fn demo_create_stream_session(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    if !state.rate_limiter.check(&client_key(&addr)).await {
+    if let Err(retry_after_s) = state.rate_limiter.check(&client_key(&addr)).await {
         return json_resp(
             StatusCode::TOO_MANY_REQUESTS,
-            json!({"error": "rate limit exceeded, try again later"}),
+            json!({"error": "rate limit exceeded, try again later", "retry_after_s": retry_after_s}),
         );
     }
 
@@ -269,8 +276,8 @@ async fn demo_create_stream_session(
         Ok(b) => b,
         Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": format!("invalid body: {e}")})),
     };
-    let body: DemoCreateStreamBody = if bytes.is_empty() {
-        DemoCreateStreamBody::default()
+    let body: CreateStreamSessionBody = if bytes.is_empty() {
+        CreateStreamSessionBody::default()
     } else {
         match serde_json::from_slice(&bytes) {
             Ok(v) => v,
@@ -278,53 +285,17 @@ async fn demo_create_stream_session(
         }
     };
 
-    let mut cfg = streaming::StreamConfig::default();
-    if let Some(v) = body.sample_rate_hz {
-        cfg.sample_rate_hz = v;
-    }
-    if let Some(v) = body.channels {
-        cfg.channels = v;
-    }
-    if let Some(v) = body.window_s {
-        cfg.window_s = v;
-    }
-    if let Some(v) = body.hop_s {
-        cfg.hop_s = v;
-    }
-    if let Some(v) = body.buffer_s {
-        cfg.buffer_s = v;
-    }
-    if let Some(v) = body.min_process_s {
-        cfg.min_process_s = v;
-    }
-    let cfg = match streaming::validate_stream_cfg(cfg) {
-        Ok(c) => c,
-        Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
-    };
-
-    let session_id = Uuid::new_v4().simple().to_string();
-    let session = streaming::StreamSession::spawn(
-        session_id.clone(),
-        cfg.clone(),
-        app.settings.data_dir.clone(),
-        app.http.clone(),
-        app.settings.api_key.clone(),
-        app.transcriber_pool.clone(),
-        app.transcribe_sem.clone(),
+    // Demo sessions are capped at the configured max audio duration (enforced
+    // server-side in the session watchdog).
+    let (session_id, cfg, session) = match crate::spawn_and_register_stream_session(
+        app,
         assets,
-        app.settings.ayah_word_time_upgrade.clone(),
-        app.settings.stream_jwt_secret.clone(),
-        app.settings.stream_jwt_audience.clone(),
-        app.settings.stream_auth_grace_s,
-        env_f64_opt("STREAM_NO_AUDIO_TIMEOUT_S", Some(30.0)).unwrap_or(30.0),
-        env_f64_opt("STREAM_SILENCE_DBFS_THRESHOLD", Some(-45.0)).unwrap_or(-45.0),
-        env_f64_opt("STREAM_SILENCE_SKIP_AFTER_S", Some(1.2)).unwrap_or(1.2),
-        env_f64_opt("STREAM_SILENCE_TIMEOUT_S", Some(60.0)).unwrap_or(60.0),
-        env_f64_opt("STREAM_TAIL_CONTEXT_S", Some(4.0)).unwrap_or(4.0),
-        env_f64_opt("STREAM_FULL_REFRESH_EVERY_S", Some(60.0)).unwrap_or(60.0),
-    );
-    app.stream_sessions
-        .insert(session_id.clone(), session.clone());
+        &body,
+        Some(app.settings.demo_max_audio_duration_s),
+    ) {
+        Ok(v) => v,
+        Err(e) => return json_resp(StatusCode::BAD_REQUEST, json!({"error": e})),
+    };
 
     let ws_path = session.ws_path();
 
