@@ -6,12 +6,30 @@ Rust-backed Quran recitation transcription and ayah alignment.
 
 ## What It Does
 
-- Runs ASR in a Python FastAPI service using `faster-whisper`.
+- Runs ASR in a Python FastAPI service using `faster-whisper` (Linux/GPU), or a native
+  Swift [WhisperKit](https://github.com/argmaxinc/WhisperKit) CoreML service on macOS.
 - Runs Quran search, verse guessing, and alignment in Rust for lower CPU latency.
 - Supports batch job transcription over HTTP.
 - Supports experimental low-latency streaming over WebSockets.
 - Keeps generated audio jobs, Hugging Face caches, and model files out of git.
 - Automatically cleans old `/data/jobs` artifacts with configurable retention.
+
+## Quick start on macOS (Apple Silicon, CoreML)
+
+Runs fully native (no Docker/CUDA) using a CoreML conversion of the Tarteel model on the
+Apple Neural Engine. The model, Quran DB, and alignment assets are bundled via **git-lfs**,
+so setup is two commands:
+
+```bash
+# Prereqs: Xcode (Swift 6), Rust, Node, ffmpeg, git-lfs   (see docs/mac.md)
+git lfs install
+git clone <repo-url> quran-asr && cd quran-asr   # LFS pulls model + db + assets
+./scripts/setup-mac.sh        # one-time: verify tools + build everything
+./scripts/run-mac.sh          # start transcriber + API + demo, then open localhost:3000
+```
+
+Full details, architecture, and verification: [`docs/mac.md`](docs/mac.md).
+The Docker/CUDA instructions below remain the path for Linux/GPU deployments.
 
 ## Repository Layout
 

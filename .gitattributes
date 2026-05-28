@@ -1,0 +1,11 @@
+# Large binary artifacts bundled for one-step setup, stored via Git LFS.
+
+# Prebuilt Quran SQLite DB (generated from data/quran.json).
+data/quran.db filter=lfs diff=lfs merge=lfs -text
+
+# v2 alignment assets (numpy arrays; passages_emb_f16.npy is ~61 MB).
+data/alignment/**/*.npy filter=lfs diff=lfs merge=lfs -text
+
+# CoreML model weights (WhisperKit format: AudioEncoder/TextDecoder/MelSpectrogram).
+mac/models/**/*.bin filter=lfs diff=lfs merge=lfs -text
+mac/models/**/*.mlmodel filter=lfs diff=lfs merge=lfs -text

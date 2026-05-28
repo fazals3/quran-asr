@@ -1,0 +1,199 @@
+{
+    "1_ios16.reshape_shape_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.1748
+    },
+    "5_pad_pad_x_constant_val_mode": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU"
+        ],
+        "cost": 2.1757
+    },
+    "7_ios16.reshape_shape_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.1766
+    },
+    "9_expand_dims_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.1766
+    },
+    "12_expand_dims_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.1766
+    },
+    "18_ios16.conv_groups_weight_x_dilations_strides_pad_pad_type": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU"
+        ],
+        "cost": 24.3845
+    },
+    "24_ios16.conv_groups_weight_x_dilations_strides_pad_pad_type": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU"
+        ],
+        "cost": 24.3845
+    },
+    "26_squeeze_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7329
+    },
+    "28_squeeze_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7329
+    },
+    "29_ios16.square_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7329
+    },
+    "30_ios16.square_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7329
+    },
+    "31_ios16.add_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 7.6386
+    },
+    "32_identity_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7329
+    },
+    "36_slice_by_index_begin_end_end_mask_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.7325
+    },
+    "40_ios16.matmul_y_transpose_y_transpose_x_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 3.5205
+    },
+    "42_ios16.add_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.5196
+    },
+    "44_ios16.log_epsilon_x": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.0874
+    },
+    "46_ios16.mul_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.4311
+    },
+    "48_ios16.reduce_max_x_keep_dims": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 0.5437
+    },
+    "50_ios16.sub_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 0.0
+    },
+    "51_ios16.maximum_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.0874
+    },
+    "53_ios16.add_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.5196
+    },
+    "55_ios16.mul_x_y": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 2.4311
+    },
+    "57_expand_dims_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.0874
+    },
+    "59_expand_dims_x_axes": {
+        "dispatch": "CPU",
+        "supported": [
+            "CPU",
+            "ANE"
+        ],
+        "cost": 1.0874
+    }
+}

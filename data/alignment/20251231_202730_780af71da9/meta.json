@@ -1,0 +1,31 @@
+{
+  "anchors": {
+    "stop_df_ratio": 0.35,
+    "stop_tokens": 4
+  },
+  "created_utc": "2025-12-31T20:27:30.410763Z",
+  "normalization": {
+    "method": "normalize_arabic + word tokens",
+    "module": "quran_text"
+  },
+  "passages": {
+    "count": 31170,
+    "embedding_dim": 1024,
+    "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+    "window_sizes": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
+  "quran_db_path": "/root/experiment/quran.db",
+  "quran_db_sha256": "780af71da9fcd0986fc85dbdcc57a1380818559acb0478535ff1f10a7e174733",
+  "reference": {
+    "total_ayahs": 6236,
+    "total_tokens": 77429,
+    "vocab_size": 14769
+  },
+  "version": "20251231_202730_780af71da9"
+}

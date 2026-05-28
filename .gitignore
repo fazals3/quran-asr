@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.mac.example
 
 __pycache__/
 *.py[cod]
@@ -14,20 +15,37 @@ api/target/
 demo/node_modules/
 demo/dist/
 
+# Swift build artifacts
+.build/
+mac/transcriber-swift/.build/
+
+# Runtime-only data (model cache, jobs, temp scratch)
 data/hf/
 data/jobs/
 data/tmp/
-data/alignment/
 data-dev/
 outputs/
-*.db
-*.sqlite
-*.sqlite3
+*.log
+
+# OS cruft
+.DS_Store
+
+# Audio scratch — never commit recitations accidentally
 *.mp3
 *.wav
 *.m4a
 *.mp4
-*.log
+
+# Databases are ignored by default, but the prebuilt Quran DB is bundled (git-lfs).
+*.db
+*.sqlite
+*.sqlite3
+!data/quran.db
+
+# Alignment assets ARE bundled (git-lfs), but exclude working/backup files.
+data/alignment/**/.DS_Store
+data/alignment/**/*.bak_*
+data/alignment/**/*.merged_active
 
 !.gitignore
 !data/quran.json
