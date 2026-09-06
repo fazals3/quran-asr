@@ -1,7 +1,11 @@
 fastapi>=0.110.0,<1.0.0
 uvicorn[standard]>=0.27.0,<1.0.0
 python-multipart>=0.0.9,<1.0.0
-faster-whisper>=1.0.0
-numpy>=1.26.0
+# NVIDIA NeMo ASR (FastConformer hybrid RNNT/CTC checkpoint). Torch is installed
+# separately in the Dockerfile from the CUDA wheel index.
+nemo_toolkit[asr]==2.6.1
+# numba (pulled in by NeMo) does not support numpy >= 2.4 yet.
+numpy>=1.26.0,<2.4
+huggingface_hub>=0.30.0
 sentence-transformers>=2.7.0
 requests>=2.31.0

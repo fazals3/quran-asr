@@ -2,7 +2,7 @@
 
 `quran-asr` is split into two runtime services:
 
-- `transcriber`: Python FastAPI wrapper around faster-whisper. It owns model loading, batched transcription, conservative repair passes, and optional embeddings.
+- `transcriber`: Python FastAPI wrapper around NVIDIA NeMo running the `Muno459/fastconformer-quran` FastConformer hybrid RNNT/CTC checkpoint. It owns model loading, ffmpeg decoding, silence-aware chunking, batched CTC decoding with word timestamps and confidences, and optional embeddings.
 - `api`: Rust Axum service. It owns auth, queueing, file intake, Quran DB lookup, surah guessing, forced ayah alignment, multi-span/jump handling, and streaming session state.
 
 The services communicate over the Docker Compose network. Uploaded files and generated job JSON are stored in `/data/jobs`, which is intentionally ignored by git.
@@ -16,6 +16,16 @@ The services communicate over the Docker Compose network. Uploaded files and gen
 5. Rust writes `result.json` and returns it from `GET /v1/jobs/:job_id`.
 
 Completed and failed job directories are retained for `JOB_RETENTION_S`, then removed by a background cleanup task. At startup, the same cleanup also removes stale job directories left behind by previous API runs.
+
+## Transcriber Internals
+
+1. ffmpeg decodes the upload to 16 kHz mono float32 and reports silences (`silencedetect`) in the same pass.
+2. Audio longer than `CHUNK_MAX_S` is split at silence midpoints; runs without silence are hard-split with `CHUNK_OVERLAP_S` of overlap.
+3. Chunks are decoded in batches with NeMo's greedy batched CTC decoder (`timestamps=True`, max-prob word confidence).
+4. Word timestamps are shifted back onto the global timeline; words from overlapped regions are kept from one side of the overlap midpoint only.
+5. Words are grouped into segments at pauses longer than `SEGMENT_GAP_S`.
+
+Streaming windows (a few seconds each) fit in a single chunk, so they skip the chunking step entirely.
 
 ## Streaming Flow
 

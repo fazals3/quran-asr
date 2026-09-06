@@ -6,11 +6,9 @@ services:
     gpus: !reset []
     environment:
       DEVICE: cpu
-      COMPUTE_TYPE: int8
       MAX_UPLOAD_BYTES: "3000000000"
   transcriber2:
     gpus: !reset []
     environment:
       DEVICE: cpu
-      COMPUTE_TYPE: int8
       MAX_UPLOAD_BYTES: "3000000000"

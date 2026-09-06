@@ -2,12 +2,16 @@
 
 Rust-backed Quran recitation transcription and ayah alignment.
 
-`quran-asr` accepts uploaded audio, transcribes Arabic Quran recitation with a faster-whisper ASR service, then force-matches the transcript to Quran verses with a Rust alignment pipeline. The API returns the transcript, likely surah/ayah range, multi-span alignment, jump detection, and timing metrics.
+`quran-asr` accepts uploaded audio, transcribes Arabic Quran recitation with an NVIDIA NeMo FastConformer ASR service, then force-matches the transcript to Quran verses with a Rust alignment pipeline. The API returns the transcript, likely surah/ayah range, multi-span alignment, jump detection, and timing metrics.
 
 ## What It Does
 
-- Runs ASR in a Python FastAPI service using `faster-whisper` (Linux/GPU), or a native
-  Swift [WhisperKit](https://github.com/argmaxinc/WhisperKit) CoreML service on macOS.
+- Runs ASR in a Python FastAPI service using NVIDIA NeMo and the
+  [`Muno459/fastconformer-quran`](https://huggingface.co/Muno459/fastconformer-quran)
+  FastConformer hybrid RNNT/CTC model (Linux/GPU). The CTC head produces frame-accurate
+  word timestamps and per-word confidences; long audio is chunked at detected silences.
+- On macOS, a native Swift [WhisperKit](https://github.com/argmaxinc/WhisperKit) CoreML
+  service still runs the Tarteel Whisper model (the FastConformer checkpoint has no CoreML build).
 - Runs Quran search, verse guessing, and alignment in Rust for lower CPU latency.
 - Supports batch job transcription over HTTP.
 - Supports experimental low-latency streaming over WebSockets.
@@ -81,6 +85,27 @@ Set at least `API_KEY`, `STREAM_JWT_SECRET`, and the GPU/throughput knobs that m
 docker compose up -d --build
 ```
 
+The transcriber downloads the `.nemo` checkpoint from Hugging Face into `data/hf` on first
+start. To use a local copy instead, place it under `data/` and set `MODEL_PATH` in `.env`
+to its path inside the container, e.g. `MODEL_PATH=/data/models/fastconformer-quran.nemo`.
+
+## Transcriber Tuning
+
+The Python service exposes a few knobs in `.env`:
+
+- `DECODER_TYPE=ctc` selects the CTC head (default, frame-accurate timestamps) or `rnnt`.
+- `CHUNK_MAX_S=15` / `CHUNK_OVERLAP_S=3.0` control how long recordings are split. Splits prefer
+  detected silences (`CHUNK_SILENCE_NOISE_DB`, `CHUNK_SILENCE_MIN_S`); hard splits overlap and are
+  deduplicated at the overlap midpoint.
+- `SEGMENT_GAP_S=1.0` groups words into output segments at pauses longer than this.
+- `BATCH_SIZE=8` is the number of chunks per forward pass; `BATCH_SIZE_CAP` ratchets down on CUDA OOM.
+- `WORD_CONFIDENCE=true` attaches a `probability` to each word from NeMo's max-prob estimator.
+
+The `/v1/transcribe` response keeps the same shape as before (`segments[].words[]` with
+`start_s`/`end_s`), so the Rust API and tools are unchanged. Whisper-era query parameters
+(`beam_size`, `patience`, `log_prob_threshold`, `no_speech_threshold`) are accepted and echoed
+under `params.ignored` but have no effect on the CTC decoder.
+
 ## API
 
 Health:
@@ -149,10 +174,14 @@ Queued and running jobs tracked by the API are never deleted. Job directories le
 
 ## Model Credits
 
-This project uses Quran-focused Whisper ASR work from the Hugging Face community:
+This project uses Quran-focused ASR work from the Hugging Face community:
 
-- [`tarteel-ai/whisper-base-ar-quran`](https://huggingface.co/tarteel-ai/whisper-base-ar-quran), an Apache-2.0 Quran fine-tuned Whisper base model from Tarteel AI.
-- [`OdyAsh/faster-whisper-base-ar-quran`](https://huggingface.co/OdyAsh/faster-whisper-base-ar-quran), an Apache-2.0 CTranslate2/faster-whisper conversion of the Tarteel model.
+- [`Muno459/fastconformer-quran`](https://huggingface.co/Muno459/fastconformer-quran), a NeMo
+  FastConformer hybrid RNNT/CTC model fine-tuned for Quranic recitation from
+  [`nvidia/stt_ar_fastconformer_hybrid_large_pcd_v1.0`](https://huggingface.co/nvidia/stt_ar_fastconformer_hybrid_large_pcd_v1.0).
+  It is the default Linux/GPU transcriber. Check the model card for its license terms before redistributing.
+- [`tarteel-ai/whisper-base-ar-quran`](https://huggingface.co/tarteel-ai/whisper-base-ar-quran), an Apache-2.0 Quran fine-tuned Whisper base model from Tarteel AI, used by the macOS CoreML path.
+- [`OdyAsh/faster-whisper-base-ar-quran`](https://huggingface.co/OdyAsh/faster-whisper-base-ar-quran), an Apache-2.0 CTranslate2/faster-whisper conversion of the Tarteel model, used by earlier releases of this project.
 
 Project cleanup, repository organization, and README drafting were assisted by Codex GPT-5.2.
 

@@ -1,17 +1,37 @@
+"""FastConformer (NVIDIA NeMo) transcriber service.
+
+Wraps the `Muno459/fastconformer-quran` hybrid RNNT/CTC checkpoint behind the
+same HTTP contract the Rust API already speaks:
+
+    POST /v1/transcribe  multipart `file` -> {"transcription": {...}, "text": ..., ...}
+    POST /v1/embed       {"text": ...}    -> float16 embedding (unchanged)
+    GET  /health
+
+Long audio is split at detected silences (hard splits with overlap when no
+silence is found), each chunk is decoded with the CTC head and greedy batched
+decoding, and per-chunk word timestamps are stitched back onto the global
+timeline. Word confidences come from NeMo's max-prob confidence estimator.
+"""
+
 import asyncio
 import base64
-import math
+import copy
+import gc
 import os
+import re
 import subprocess
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+
+SAMPLE_RATE = 16000
+_UNK_WORDS = {"<unk>", "⁇"}
 
 
 def _env(name: str, default: str) -> str:
@@ -30,16 +50,6 @@ def _env_float(name: str, default: float) -> float:
     v = os.environ.get(name)
     if v is None or str(v).strip() == "":
         return float(default)
-    return float(v)
-
-
-def _env_float_optional(name: str, default: Optional[float]) -> Optional[float]:
-    v = os.environ.get(name)
-    if v is None or str(v).strip() == "":
-        return default
-    s = str(v).strip().lower()
-    if s in {"none", "null", "off", "false", "disabled"}:
-        return None
     return float(v)
 
 
@@ -67,34 +77,25 @@ def format_timestamp(seconds: float) -> str:
 class Settings:
     api_key: str
     model_id: str
+    model_path: str
+    model_revision: str
     language: str
     device: str
-    compute_type: str
-    transcribe_backend: str
+    decoder_type: str
 
-    beam_size: int
-    patience: float
-    word_timestamps: bool
-    log_prob_threshold: Optional[float]
-    no_speech_threshold: Optional[float]
     batch_size: int
     batch_size_cap: int
+
+    chunk_max_s: float
+    chunk_overlap_s: float
+    chunk_silence_noise_db: float
+    chunk_silence_min_s: float
+    segment_gap_s: float
+    word_confidence: bool
 
     embed_model_id: str
     embed_device: str
     warm_embedder: bool
-
-    enable_repair: bool
-    repair_max_windows: int
-    repair_context_s: float
-    repair_gap_trigger_s: float
-    repair_low_words_duration_s: float
-    repair_low_words_max_words: int
-
-    enable_dedupe: bool
-    dedupe_min_words: int
-    dedupe_max_words: int
-    dedupe_max_gap_s: float
 
     max_upload_bytes: int
     max_concurrent_transcribes: int
@@ -103,41 +104,34 @@ class Settings:
 def load_settings() -> Settings:
     return Settings(
         api_key=_env("API_KEY", "").strip(),
-        model_id=_env("MODEL_ID", "OdyAsh/faster-whisper-base-ar-quran"),
+        model_id=_env("MODEL_ID", "Muno459/fastconformer-quran").strip(),
+        model_path=_env("MODEL_PATH", "").strip(),
+        model_revision=_env("MODEL_REVISION", "").strip(),
         language=_env("LANGUAGE", "ar"),
-        device=_env("DEVICE", "cuda"),
-        compute_type=_env("COMPUTE_TYPE", "float16"),
-        transcribe_backend=_env("TRANSCRIBE_BACKEND", "batched").strip().lower(),
-        beam_size=_env_int("BEAM_SIZE", 5),
-        patience=_env_float("PATIENCE", 1.2),
-        word_timestamps=_env_bool("WORD_TIMESTAMPS", True),
-        log_prob_threshold=_env_float_optional("WHISPER_LOG_PROB_THRESHOLD", -0.15),
-        no_speech_threshold=_env_float_optional("WHISPER_NO_SPEECH_THRESHOLD", 0.0),
-        batch_size=_env_int("BATCH_SIZE", 32),
-        batch_size_cap=_env_int("BATCH_SIZE_CAP", 128),
+        device=_env("DEVICE", "cuda").strip().lower(),
+        decoder_type=_env("DECODER_TYPE", "ctc").strip().lower(),
+        batch_size=_env_int("BATCH_SIZE", 8),
+        batch_size_cap=_env_int("BATCH_SIZE_CAP", 32),
+        chunk_max_s=_env_float("CHUNK_MAX_S", 15.0),
+        chunk_overlap_s=_env_float("CHUNK_OVERLAP_S", 3.0),
+        chunk_silence_noise_db=_env_float("CHUNK_SILENCE_NOISE_DB", -32.0),
+        chunk_silence_min_s=_env_float("CHUNK_SILENCE_MIN_S", 0.35),
+        segment_gap_s=_env_float("SEGMENT_GAP_S", 1.0),
+        word_confidence=_env_bool("WORD_CONFIDENCE", True),
         embed_model_id=_env("EMBEDDING_MODEL_ID", "").strip(),
         embed_device=_env("EMBEDDING_DEVICE", "cuda").strip(),
         warm_embedder=_env_bool("WARM_EMBEDDER", False),
-        enable_repair=_env_bool("TRANSCRIBE_ENABLE_REPAIR", True),
-        repair_max_windows=_env_int("TRANSCRIBE_REPAIR_MAX_WINDOWS", 3),
-        repair_context_s=_env_float("TRANSCRIBE_REPAIR_CONTEXT_S", 3.0),
-        repair_gap_trigger_s=_env_float("TRANSCRIBE_REPAIR_GAP_TRIGGER_S", 6.0),
-        repair_low_words_duration_s=_env_float("TRANSCRIBE_REPAIR_LOW_WORDS_DURATION_S", 12.0),
-        repair_low_words_max_words=_env_int("TRANSCRIBE_REPAIR_LOW_WORDS_MAX_WORDS", 6),
-        enable_dedupe=_env_bool("TRANSCRIBE_ENABLE_DEDUPE", True),
-        dedupe_min_words=_env_int("TRANSCRIBE_DEDUPE_MIN_WORDS", 4),
-        dedupe_max_words=_env_int("TRANSCRIBE_DEDUPE_MAX_WORDS", 14),
-        dedupe_max_gap_s=_env_float("TRANSCRIBE_DEDUPE_MAX_GAP_S", 0.8),
         max_upload_bytes=_env_int("MAX_UPLOAD_BYTES", 200 * 1024 * 1024),
         max_concurrent_transcribes=_env_int("MAX_CONCURRENT_TRANSCRIBES", 1),
     )
 
 
 settings = load_settings()
-app = FastAPI(title="Rust-backed Transcriber", version="1.0")
+app = FastAPI(title="Rust-backed Transcriber", version="2.0")
 
 _model: Any = None
-_pipeline: Any = None
+_model_source: str = ""
+_model_lock = threading.Lock()
 _embedder: Any = None
 _sem = asyncio.Semaphore(max(1, int(settings.max_concurrent_transcribes)))
 _batch_size_cap = max(1, int(settings.batch_size_cap))
@@ -155,22 +149,81 @@ def _require_internal_access(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def _lazy_load_model_and_pipeline() -> Tuple[Any, Any]:
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+
+def _resolve_checkpoint() -> str:
+    """Return a local `.nemo` path: `MODEL_PATH` if set, else download from Hugging Face."""
+    if settings.model_path:
+        if not os.path.isfile(settings.model_path):
+            raise RuntimeError(f"MODEL_PATH does not exist: {settings.model_path}")
+        return settings.model_path
+
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    revision = settings.model_revision or None
+    files = list_repo_files(settings.model_id, revision=revision)
+    nemo_files = sorted(f for f in files if f.endswith(".nemo"))
+    if not nemo_files:
+        raise RuntimeError(f"no .nemo checkpoint found in {settings.model_id}: {files}")
+    return hf_hub_download(settings.model_id, nemo_files[0], revision=revision)
+
+
+def _lazy_load_model() -> Any:
     global _model
-    global _pipeline
-    if _model is not None and _pipeline is not None:
-        return _model, _pipeline
+    global _model_source
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
 
-    from faster_whisper import WhisperModel
-    from faster_whisper.transcribe import BatchedInferencePipeline
+        import torch
+        import nemo.collections.asr as nemo_asr
+        from nemo.utils import logging as nemo_logging
+        from omegaconf import open_dict
 
-    _model = WhisperModel(
-        settings.model_id,
-        device=settings.device,
-        compute_type=settings.compute_type,
-    )
-    _pipeline = BatchedInferencePipeline(_model)
-    return _model, _pipeline
+        nemo_logging.setLevel(nemo_logging.WARNING)
+
+        device = settings.device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            device = "cpu"
+
+        ckpt = _resolve_checkpoint()
+        model = nemo_asr.models.ASRModel.restore_from(ckpt, map_location=device)
+        model.eval()
+
+        # Hybrid RNNT+CTC checkpoint: the CTC head gives frame-accurate word
+        # timestamps and avoids RNNT CUDA-graph decoding.
+        if hasattr(model, "change_decoding_strategy"):
+            decoder_type = settings.decoder_type if settings.decoder_type in {"ctc", "rnnt"} else "ctc"
+            if decoder_type == "ctc" and hasattr(model.cfg, "aux_ctc"):
+                decoding_cfg = copy.deepcopy(model.cfg.aux_ctc.decoding)
+            else:
+                decoding_cfg = copy.deepcopy(model.cfg.decoding)
+            with open_dict(decoding_cfg):
+                decoding_cfg.strategy = "greedy_batch"
+                decoding_cfg.compute_timestamps = True
+                decoding_cfg.preserve_alignments = True
+                if settings.word_confidence:
+                    decoding_cfg.confidence_cfg = {
+                        "preserve_frame_confidence": True,
+                        "preserve_token_confidence": True,
+                        "preserve_word_confidence": True,
+                        "exclude_blank": True,
+                        "aggregation": "min",
+                        "method_cfg": {"name": "max_prob"},
+                    }
+            try:
+                model.change_decoding_strategy(decoding_cfg=decoding_cfg, decoder_type=decoder_type)
+            except TypeError:
+                model.change_decoding_strategy(decoding_cfg=decoding_cfg)
+
+        _model_source = ckpt
+        _model = model
+        return _model
 
 
 def _lazy_load_embedder() -> Any:
@@ -187,7 +240,7 @@ def _lazy_load_embedder() -> Any:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    _lazy_load_model_and_pipeline()
+    _lazy_load_model()
     if settings.warm_embedder and settings.embed_model_id:
         try:
             emb = _lazy_load_embedder().encode(["الحمد لله"], normalize_embeddings=True, show_progress_bar=False)
@@ -201,14 +254,17 @@ def health(_=Depends(_require_internal_access)) -> Dict[str, Any]:
     return {
         "ok": True,
         "time": time.time(),
+        "backend": "nemo-fastconformer",
         "model_id": settings.model_id,
+        "model_path": settings.model_path or None,
+        "model_loaded": _model is not None,
         "device": settings.device,
-        "compute_type": settings.compute_type,
-        "transcribe_backend": settings.transcribe_backend,
+        "decoder_type": settings.decoder_type,
         "batch_size": int(settings.batch_size),
-        "batch_size_cap": int(settings.batch_size_cap),
+        "batch_size_cap": int(_batch_size_cap),
+        "chunk_max_s": float(settings.chunk_max_s),
+        "chunk_overlap_s": float(settings.chunk_overlap_s),
         "max_concurrent_transcribes": int(settings.max_concurrent_transcribes),
-        "repair_enabled": bool(settings.enable_repair),
         "embedding_model_id": settings.embed_model_id or None,
         "embedding_device": settings.embed_device or None,
     }
@@ -228,528 +284,262 @@ def _safe_stream_copy(src, dst_path: str, *, max_bytes: int) -> int:
     return int(total)
 
 
-def _transcribe_file(
-    *,
-    audio_path: str,
-    language: str,
-    beam_size: int,
-    patience: float,
-    word_timestamps: bool,
-    log_prob_threshold: Optional[float],
-    no_speech_threshold: Optional[float],
-    batch_size: int,
-) -> Tuple[Dict[str, Any], str, int]:
-    global _batch_size_cap
-    _lazy_load_model_and_pipeline()
-    assert _model is not None
-    assert _pipeline is not None
+# ---------------------------------------------------------------------------
+# Audio decode + silence-aware chunking
+# ---------------------------------------------------------------------------
 
-    vad_params: Dict[str, Any] = dict(
-        threshold=0.15,
-        min_speech_duration_ms=150,
-        min_silence_duration_ms=1400,
-        speech_pad_ms=700,
-        # Note: BatchedInferencePipeline overrides max_speech_duration_s to `chunk_length` (default Whisper=30s).
-        max_speech_duration_s=30,
-    )
+_SIL_RE = re.compile(r"silence_(start|end): ([0-9.]+)")
 
-    base_kwargs: Dict[str, Any] = dict(
-        language=str(language),
-        temperature=0.0,
-        beam_size=int(beam_size),
-        patience=float(patience),
-        condition_on_previous_text=False,
-        vad_filter=True,
-        vad_parameters=vad_params,
-        word_timestamps=bool(word_timestamps),
-    )
-    if log_prob_threshold is not None:
-        base_kwargs["log_prob_threshold"] = float(log_prob_threshold)
-    if no_speech_threshold is not None:
-        base_kwargs["no_speech_threshold"] = float(no_speech_threshold)
 
-    bs_req = max(1, int(batch_size))
-    with _batch_size_lock:
-        bs = min(bs_req, max(1, int(_batch_size_cap)))
-
-    def to_json(segments_iter: Any) -> Tuple[list, list]:
-        segments_out = []
-        text_parts = []
-        for seg in segments_iter:
-            seg_text = (seg.text or "").strip()
-            start_s = float(seg.start)
-            end_s = float(seg.end)
-            item: Dict[str, Any] = {
-                "start_s": start_s,
-                "end_s": end_s,
-                "start_ts": format_timestamp(start_s),
-                "end_ts": format_timestamp(end_s),
-                "text": seg_text,
-            }
-
-            for k in ("avg_logprob", "no_speech_prob", "compression_ratio", "temperature"):
-                v = getattr(seg, k, None)
-                if v is not None:
-                    try:
-                        item[k] = float(v)
-                    except Exception:
-                        pass
-
-            if word_timestamps and getattr(seg, "words", None):
-                words_out = []
-                for w in seg.words:
-                    word_text = (w.word or "").strip()
-                    if not word_text:
-                        continue
-                    ws = float(w.start)
-                    we = float(w.end)
-                    words_out.append(
-                        {
-                            "start_s": ws,
-                            "end_s": we,
-                            "start_ts": format_timestamp(ws),
-                            "end_ts": format_timestamp(we),
-                            "word": word_text,
-                            "probability": float(getattr(w, "probability", math.nan)),
-                        }
-                    )
-                item["words"] = words_out
-
-            segments_out.append(item)
-            if seg_text:
-                text_parts.append(seg_text)
-        return segments_out, text_parts
-
-    def ffmpeg_slice(src: str, start_s: float, end_s: float, dst: str) -> None:
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{float(start_s):.3f}",
-            "-to",
-            f"{float(end_s):.3f}",
-            "-i",
-            src,
-            "-vn",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            dst,
-        ]
-        subprocess.check_call(cmd)
-
-    def transcribe_standard(path: str, *, vad_filter_override: Optional[bool] = None) -> Tuple[Dict[str, Any], str]:
-        assert _model is not None
-        kwargs = dict(base_kwargs)
-        if vad_filter_override is not None:
-            kwargs["vad_filter"] = bool(vad_filter_override)
-        segments_iter, info = _model.transcribe(path, **kwargs)
-        segs, parts = to_json(segments_iter)
-        transcription: Dict[str, Any] = {
-            "language": str(info.language),
-            "language_probability": float(info.language_probability),
-            "duration_s": float(info.duration),
-            "segments": segs,
-        }
-        return transcription, " ".join(parts).strip()
-
-    _ARABIC_DIACRITIC_RANGES = [
-        (0x0610, 0x061A),
-        (0x064B, 0x065F),
-        (0x06D6, 0x06DC),
-        (0x06DD, 0x06E4),
-        (0x06E7, 0x06E8),
-        (0x06EA, 0x06ED),
+def decode_audio(path: str, *, noise_db: float, min_sil_s: float) -> Tuple[np.ndarray, List[float]]:
+    """Decode any ffmpeg-readable file to 16 kHz mono float32 and detect silences in one pass."""
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "info",
+        "-i",
+        path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-af",
+        f"silencedetect=noise={float(noise_db)}dB:d={float(min_sil_s)}",
+        "-f",
+        "f32le",
+        "-",
     ]
-    _ARABIC_DIACRITIC_SINGLE = {0x0670}
-    _ARABIC_TATWEEL = 0x0640
-    _ARABIC_TRANSLATE = {
-        0x0623: 0x0627,  # أ -> ا
-        0x0625: 0x0627,  # إ -> ا
-        0x0622: 0x0627,  # آ -> ا
-        0x0671: 0x0627,  # ٱ -> ا
-        0x0624: 0x0648,  # ؤ -> و
-        0x0626: 0x064A,  # ئ -> ي
-        0x0649: 0x064A,  # ى -> ي
-        0x0629: 0x0647,  # ة -> ه
-    }
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise ValueError("ffmpeg decode failed: " + " | ".join(tail))
+    audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    duration_s = float(audio.shape[0]) / SAMPLE_RATE
 
-    def _is_arabic_diacritic(cp: int) -> bool:
-        if cp in _ARABIC_DIACRITIC_SINGLE:
-            return True
-        for a, b in _ARABIC_DIACRITIC_RANGES:
-            if a <= cp <= b:
-                return True
-        return False
+    events = [(kind, float(val)) for kind, val in _SIL_RE.findall(proc.stderr.decode("utf-8", "replace"))]
+    cuts: List[float] = []
+    start: Optional[float] = None
+    for kind, t in events:
+        if kind == "start":
+            start = t
+        elif kind == "end" and start is not None:
+            # Cut near the start of the silence so the pause and the next words land in the next chunk.
+            cuts.append(min((start + t) / 2.0, start + 0.6))
+            start = None
+    cuts = sorted(c for c in cuts if 0.0 < c < duration_s)
+    return audio, cuts
 
-    def _normalize_word_for_dedupe(w: str) -> str:
-        # Small, deterministic normalizer (mirrors quran_text.normalize_token contract).
-        w = str(w or "").strip()
-        if not w:
-            return ""
-        out = []
-        for ch in w:
-            cp = ord(ch)
-            if cp == _ARABIC_TATWEEL:
-                continue
-            if _is_arabic_diacritic(cp):
-                continue
-            cp = _ARABIC_TRANSLATE.get(cp, cp)
-            out.append(chr(cp))
-        s = "".join(out)
-        # Keep only word-ish chars and remove spaces.
-        s2 = []
-        for ch in s:
-            if ch.isspace():
-                continue
-            if ch.isalnum() or ch == "_" or ("\u0660" <= ch <= "\u0669"):
-                s2.append(ch)
-                continue
-            # Drop punctuation/symbols.
-        return "".join(s2)
 
-    def dedupe_overlapping_prefixes(
-        segs: list,
-        *,
-        min_words: int,
-        max_words: int,
-        max_gap_s: float,
-    ) -> Tuple[list, Dict[str, Any]]:
-        # Removes duplicated prefixes when a chunk boundary repeats the last few words of the previous segment.
-        out = []
-        meta: Dict[str, Any] = {"removed_total_words": 0, "pairs": 0}
+@dataclass(frozen=True)
+class Chunk:
+    start_s: float
+    end_s: float
+    keep_from_s: float  # drop stitched words starting before this
+    keep_to_s: float  # drop stitched words starting at/after this
 
-        ss = [s for s in segs if isinstance(s, dict)]
-        ss.sort(key=lambda x: float(x.get("start_s") or 0.0))
-        for seg in ss:
-            if not out:
-                out.append(seg)
-                continue
-            prev = out[-1]
+
+def build_chunks(duration_s: float, cuts: List[float], *, max_chunk_s: float, overlap_s: float) -> List[Chunk]:
+    if duration_s <= 0.0:
+        return []
+    overlap_s = max(0.0, min(float(overlap_s), float(max_chunk_s) / 2.0))
+    bounds: List[Tuple[float, float, bool]] = []  # (start, end, hard_split_end)
+    pos = 0.0
+    while pos < duration_s - 0.05:
+        limit = pos + max_chunk_s
+        if limit >= duration_s:
+            bounds.append((pos, duration_s, False))
+            break
+        candidates = [c for c in cuts if pos + 1.0 < c <= limit]
+        if candidates:
+            bounds.append((pos, candidates[-1], False))
+            pos = candidates[-1]
+        else:
+            bounds.append((pos, limit, True))
+            pos = limit - overlap_s
+    if not bounds:
+        bounds.append((0.0, duration_s, False))
+    chunks: List[Chunk] = []
+    for i, (s, e, hard) in enumerate(bounds):
+        keep_from = s
+        if i > 0:
+            _prev_s, prev_e, prev_hard = bounds[i - 1]
+            if prev_hard:
+                keep_from = prev_e - overlap_s / 2.0
+        keep_to = e
+        if hard:
+            keep_to = e - overlap_s / 2.0
+        chunks.append(Chunk(start_s=s, end_s=e, keep_from_s=keep_from, keep_to_s=keep_to))
+    return chunks
+
+
+def _slice(audio: np.ndarray, chunk: Chunk) -> np.ndarray:
+    a = int(round(chunk.start_s * SAMPLE_RATE))
+    b = int(round(chunk.end_s * SAMPLE_RATE))
+    return np.ascontiguousarray(audio[a:b], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+
+def _words_from_hypothesis(hyp: Any, offset_s: float) -> List[Dict[str, Any]]:
+    ts = getattr(hyp, "timestamp", None) or {}
+    raw_words = ts.get("word", []) if isinstance(ts, dict) else []
+    confs = getattr(hyp, "word_confidence", None)
+    use_conf = isinstance(confs, (list, tuple)) and len(confs) == len(raw_words)
+
+    out: List[Dict[str, Any]] = []
+    for i, w in enumerate(raw_words):
+        text = str(w.get("word") or "").strip()
+        if not text or text in _UNK_WORDS:
+            continue
+        start = w.get("start")
+        if start is None:
+            continue
+        end = w.get("end")
+        ws = float(start) + offset_s
+        we = (float(end) if end is not None else float(start)) + offset_s
+        if we < ws:
+            we = ws
+        item: Dict[str, Any] = {
+            "start_s": ws,
+            "end_s": we,
+            "start_ts": format_timestamp(ws),
+            "end_ts": format_timestamp(we),
+            "word": text,
+        }
+        if use_conf:
             try:
-                gap = float(seg.get("start_s") or 0.0) - float(prev.get("end_s") or 0.0)
-            except Exception:
-                gap = 999.0
-            if gap > float(max_gap_s):
-                out.append(seg)
-                continue
-
-            prev_words = prev.get("words")
-            cur_words = seg.get("words")
-            if not isinstance(prev_words, list) or not isinstance(cur_words, list) or not prev_words or not cur_words:
-                out.append(seg)
-                continue
-
-            prev_norm = [_normalize_word_for_dedupe(w.get("word") or "") for w in prev_words if isinstance(w, dict)]
-            cur_norm = [_normalize_word_for_dedupe(w.get("word") or "") for w in cur_words if isinstance(w, dict)]
-            if not prev_norm or not cur_norm:
-                out.append(seg)
-                continue
-
-            max_k = min(int(max_words), len(prev_norm), len(cur_norm))
-            best_k = 0
-            for k in range(max_k, int(min_words) - 1, -1):
-                if prev_norm[-k:] == cur_norm[:k]:
-                    best_k = k
-                    break
-            if best_k <= 0:
-                out.append(seg)
-                continue
-
-            trimmed = cur_words[best_k:]
-            if not trimmed:
-                meta["removed_total_words"] += best_k
-                meta["pairs"] += 1
-                continue
-
-            seg["words"] = trimmed
-            seg["text"] = " ".join([str(w.get("word") or "").strip() for w in trimmed if isinstance(w, dict)]).strip()
-            try:
-                ws = float(trimmed[0].get("start_s") or float(seg.get("start_s") or 0.0))
-                seg["start_s"] = ws
-                seg["start_ts"] = format_timestamp(ws)
+                item["probability"] = float(confs[i])
             except Exception:
                 pass
+        out.append(item)
+    return out
 
-            meta["removed_total_words"] += best_k
-            meta["pairs"] += 1
-            out.append(seg)
 
-        # Keep non-dict entries (shouldn't exist, but be safe).
-        for s in segs:
-            if not isinstance(s, dict):
-                out.append(s)
-        out.sort(key=lambda x: float(x.get("start_s") or 0.0) if isinstance(x, dict) else 0.0)
-        return out, meta
+def _group_segments(words: List[Dict[str, Any]], *, gap_s: float) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    cur: List[Dict[str, Any]] = []
+    for w in words:
+        if cur and (float(w["start_s"]) - float(cur[-1]["end_s"])) > float(gap_s):
+            segments.append(_make_segment(cur))
+            cur = []
+        cur.append(w)
+    if cur:
+        segments.append(_make_segment(cur))
+    return segments
 
-    def pick_repair_windows(
-        segs: list, *, duration_s: float, gap_trigger_s: float, low_words_duration_s: float, low_words_max_words: int
-    ) -> list[tuple[float, float, str]]:
-        # Returns list of (core_start_s, core_end_s, kind).
-        if not segs:
-            return []
 
-        # Collect candidate windows with a severity score, then repair only the top-K worst windows.
-        # This avoids missing a late large gap just because earlier smaller windows filled the budget.
-        items: list[tuple[float, float, str, float]] = []
-        ss = sorted([s for s in segs if isinstance(s, dict)], key=lambda x: float(x.get("start_s") or 0.0))
-        prev_end = None
-        for s in ss:
-            st = float(s.get("start_s") or 0.0)
-            en = float(s.get("end_s") or st)
-            if prev_end is not None:
-                gap = st - prev_end
-                if gap >= float(gap_trigger_s):
-                    a = max(0.0, float(prev_end))
-                    b = min(float(duration_s), float(st))
-                    score = max(0.0, b - a)
-                    items.append((a, b, "gap", score))
-            prev_end = en
+def _make_segment(words: List[Dict[str, Any]]) -> Dict[str, Any]:
+    start_s = float(words[0]["start_s"])
+    end_s = float(max(float(w["end_s"]) for w in words))
+    probs = [float(w["probability"]) for w in words if "probability" in w]
+    seg: Dict[str, Any] = {
+        "start_s": start_s,
+        "end_s": end_s,
+        "start_ts": format_timestamp(start_s),
+        "end_ts": format_timestamp(end_s),
+        "text": " ".join(str(w["word"]) for w in words),
+        "words": words,
+    }
+    if probs:
+        seg["avg_probability"] = float(sum(probs) / len(probs))
+    return seg
 
-        for s in ss:
-            st = float(s.get("start_s") or 0.0)
-            en = float(s.get("end_s") or st)
-            dur = max(0.0, en - st)
-            if dur < float(low_words_duration_s):
-                continue
-            words = s.get("words")
-            wc = len(words) if isinstance(words, list) else len(str(s.get("text") or "").strip().split())
-            if wc <= int(low_words_max_words):
-                a = max(0.0, st)
-                b = min(float(duration_s), en)
-                score = max(0.0, b - a) * (1.0 + float(int(low_words_max_words) - int(wc)))
-                items.append((a, b, "low_words", score))
 
-        # Merge overlaps (conservative) and cap count.
-        items.sort(key=lambda t: (t[0], t[1]))
-        merged: list[tuple[float, float, str, float]] = []
-        for a, b, kind, score in items:
-            if b <= a:
-                continue
-            if not merged:
-                merged.append((a, b, kind, float(score)))
-                continue
-            pa, pb, pk, ps = merged[-1]
-            if a <= pb + 0.25:
-                merged[-1] = (pa, max(pb, b), (pk if pk == kind else "mixed"), max(ps, float(score)))
-            else:
-                merged.append((a, b, kind, float(score)))
+def _is_oom(e: BaseException) -> bool:
+    msg = str(e).lower()
+    return "out of memory" in msg or "cuda failed" in msg or "cublas_status_alloc_failed" in msg
 
-        k = max(0, int(settings.repair_max_windows))
-        if k <= 0 or not merged:
-            return []
 
-        # Select by severity, then process in time order for stable behavior.
-        merged.sort(key=lambda t: (-t[3], t[0], t[1]))
-        chosen = merged[:k]
-        chosen.sort(key=lambda t: (t[0], t[1]))
-        return [(a, b, kind) for a, b, kind, _score in chosen]
+def _run_model(model: Any, clips: List[np.ndarray], *, batch_size: int) -> List[Any]:
+    import torch
 
-    def repair_segments(
-        segs: list, *, duration_s: float, context_s: float, gap_trigger_s: float, low_words_duration_s: float, low_words_max_words: int
-    ) -> Tuple[list, Dict[str, Any]]:
-        windows = pick_repair_windows(
-            segs,
-            duration_s=float(duration_s),
-            gap_trigger_s=float(gap_trigger_s),
-            low_words_duration_s=float(low_words_duration_s),
-            low_words_max_words=int(low_words_max_words),
+    with torch.inference_mode():
+        hyps = model.transcribe(
+            clips,
+            batch_size=int(batch_size),
+            return_hypotheses=True,
+            timestamps=True,
+            num_workers=0,
+            verbose=False,
         )
-        if not windows:
-            return segs, {"windows": [], "applied": 0}
+    if isinstance(hyps, tuple):  # some NeMo versions return (best, n-best)
+        hyps = hyps[0]
+    return list(hyps)
 
-        out = [s for s in segs if isinstance(s, dict)]
-        meta = {"windows": [], "applied": 0}
 
-        for core_start, core_end, kind in windows:
-            if core_end - core_start < 0.5:
-                continue
+def _transcribe_file(*, audio_path: str, batch_size: int) -> Tuple[Dict[str, Any], str, int]:
+    global _batch_size_cap
+    model = _lazy_load_model()
 
-            pad = float(max(0.0, context_s))
-            pad_start = max(0.0, float(core_start) - pad)
-            pad_end = min(float(duration_s), float(core_end) + pad)
-            if pad_end - pad_start < 0.5:
-                continue
+    audio, cuts = decode_audio(
+        audio_path,
+        noise_db=float(settings.chunk_silence_noise_db),
+        min_sil_s=float(settings.chunk_silence_min_s),
+    )
+    duration_s = float(audio.shape[0]) / SAMPLE_RATE
+    chunks = build_chunks(
+        duration_s,
+        cuts,
+        max_chunk_s=float(settings.chunk_max_s),
+        overlap_s=float(settings.chunk_overlap_s),
+    )
+    clips = [_slice(audio, c) for c in chunks]
+    # Drop chunks too short for the mel front-end (they carry no speech anyway).
+    keep = [i for i, clip in enumerate(clips) if clip.shape[0] >= SAMPLE_RATE // 10]
+    chunks = [chunks[i] for i in keep]
+    clips = [clips[i] for i in keep]
 
-            with tempfile.TemporaryDirectory(prefix="repair_") as td:
-                clip_path = os.path.join(td, "clip.wav")
-                ffmpeg_slice(audio_path, pad_start, pad_end, clip_path)
-
-                # For repair clips, disable VAD so we don't accidentally drop the very region we're trying to recover.
-                clip_tx, _ = transcribe_standard(clip_path, vad_filter_override=False)
-                clip_segs = clip_tx.get("segments") if isinstance(clip_tx, dict) else None
-                if not isinstance(clip_segs, list) or not clip_segs:
-                    meta["windows"].append(
-                        {
-                            "kind": kind,
-                            "core_start_s": core_start,
-                            "core_end_s": core_end,
-                            "pad_start_s": pad_start,
-                            "pad_end_s": pad_end,
-                            "status": "no_segments",
-                        }
-                    )
-                    continue
-
-                repaired: list[Dict[str, Any]] = []
-                for s in clip_segs:
-                    if not isinstance(s, dict):
-                        continue
-                    st = float(s.get("start_s") or 0.0) + pad_start
-                    en = float(s.get("end_s") or st) + pad_start
-                    if en <= core_start or st >= core_end:
-                        continue
-                    st2 = max(float(core_start), st)
-                    en2 = min(float(core_end), en)
-                    if en2 <= st2:
-                        continue
-                    item = dict(s)
-                    item["start_s"] = st2
-                    item["end_s"] = en2
-                    item["start_ts"] = format_timestamp(st2)
-                    item["end_ts"] = format_timestamp(en2)
-                    words = item.get("words")
-                    if isinstance(words, list) and words:
-                        kept = []
-                        for w in words:
-                            if not isinstance(w, dict):
-                                continue
-                            ws = float(w.get("start_s") or 0.0) + pad_start
-                            we = float(w.get("end_s") or ws) + pad_start
-                            if we <= core_start or ws >= core_end:
-                                continue
-                            ws2 = max(float(core_start), ws)
-                            we2 = min(float(core_end), we)
-                            if we2 <= ws2:
-                                continue
-                            ww = dict(w)
-                            ww["start_s"] = ws2
-                            ww["end_s"] = we2
-                            ww["start_ts"] = format_timestamp(ws2)
-                            ww["end_ts"] = format_timestamp(we2)
-                            kept.append(ww)
-                        item["words"] = kept
-                    repaired.append(item)
-
-                if not repaired:
-                    meta["windows"].append(
-                        {
-                            "kind": kind,
-                            "core_start_s": core_start,
-                            "core_end_s": core_end,
-                            "pad_start_s": pad_start,
-                            "pad_end_s": pad_end,
-                            "status": "no_overlap_after_clip",
-                        }
-                    )
-                    continue
-
-                # Remove any original segments intersecting the core window, then insert repaired.
-                kept = []
-                for s in out:
-                    st = float(s.get("start_s") or 0.0)
-                    en = float(s.get("end_s") or st)
-                    if en <= core_start or st >= core_end:
-                        kept.append(s)
-                out = kept + repaired
-                out.sort(key=lambda x: float(x.get("start_s") or 0.0))
-                meta["applied"] += 1
-                meta["windows"].append(
-                    {
-                        "kind": kind,
-                        "core_start_s": core_start,
-                        "core_end_s": core_end,
-                        "pad_start_s": pad_start,
-                        "pad_end_s": pad_end,
-                        "status": "applied",
-                        "segments_added": len(repaired),
-                    }
-                )
-
-        return out, meta
+    with _batch_size_lock:
+        bs = min(max(1, int(batch_size)), max(1, int(_batch_size_cap)))
 
     while True:
-        kwargs = dict(base_kwargs)
-        kwargs["batch_size"] = int(bs)
         try:
-            backend = str(settings.transcribe_backend or "batched").strip().lower()
-            if backend in {"standard", "whisper"}:
-                transcription, full_text = transcribe_standard(audio_path)
-                return transcription, full_text, int(bs)
-
-            segments_iter, info = _pipeline.transcribe(audio_path, **kwargs)
-            segments_out, text_parts = to_json(segments_iter)
-
-            duration_s = float(info.duration)
-            repair_meta: Dict[str, Any] = {"windows": [], "applied": 0}
-            dedupe_meta: Dict[str, Any] = {"pairs": 0, "removed_total_words": 0}
-            if settings.enable_dedupe:
-                segments_out, dedupe_meta = dedupe_overlapping_prefixes(
-                    segments_out,
-                    min_words=int(settings.dedupe_min_words),
-                    max_words=int(settings.dedupe_max_words),
-                    max_gap_s=float(settings.dedupe_max_gap_s),
-                )
-
-            # Repair after dedupe: overlap trimming can expose true gaps that need to be re-transcribed.
-            if settings.enable_repair:
-                segments_out, repair_meta = repair_segments(
-                    segments_out,
-                    duration_s=duration_s,
-                    context_s=float(settings.repair_context_s),
-                    gap_trigger_s=float(settings.repair_gap_trigger_s),
-                    low_words_duration_s=float(settings.repair_low_words_duration_s),
-                    low_words_max_words=int(settings.repair_low_words_max_words),
-                )
-
-            # A second dedupe pass cleans up any overlaps introduced by the repair window insertion.
-            if settings.enable_dedupe:
-                segments_out, dedupe_meta2 = dedupe_overlapping_prefixes(
-                    segments_out,
-                    min_words=int(settings.dedupe_min_words),
-                    max_words=int(settings.dedupe_max_words),
-                    max_gap_s=float(settings.dedupe_max_gap_s),
-                )
-                dedupe_meta = {
-                    "pairs": int(dedupe_meta.get("pairs") or 0) + int(dedupe_meta2.get("pairs") or 0),
-                    "removed_total_words": int(dedupe_meta.get("removed_total_words") or 0)
-                    + int(dedupe_meta2.get("removed_total_words") or 0),
-                }
-
-            transcription = {
-                "language": str(info.language),
-                "language_probability": float(info.language_probability),
-                "duration_s": duration_s,
-                "segments": segments_out,
-            }
-            if settings.enable_repair:
-                transcription["repair"] = repair_meta
-            if settings.enable_dedupe:
-                transcription["dedupe"] = dedupe_meta
-
-            full_text = " ".join([str(s.get("text") or "").strip() for s in segments_out if isinstance(s, dict)]).strip()
-            return transcription, full_text, int(bs)
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "out of memory" not in msg and "cuda failed" not in msg:
-                raise
-            if bs <= 1:
+            words: List[Dict[str, Any]] = []
+            with _model_lock:
+                for i in range(0, len(clips), bs):
+                    hyps = _run_model(model, clips[i : i + bs], batch_size=bs)
+                    for hyp, ch in zip(hyps, chunks[i : i + bs]):
+                        for w in _words_from_hypothesis(hyp, ch.start_s):
+                            if ch.keep_from_s - 1e-6 <= float(w["start_s"]) < ch.keep_to_s + 1e-6:
+                                words.append(w)
+            break
+        except Exception as e:  # noqa: BLE001 - we only retry on CUDA OOM
+            if not _is_oom(e) or bs <= 1:
                 raise
             bs = max(1, bs // 2)
             with _batch_size_lock:
                 _batch_size_cap = min(max(1, int(_batch_size_cap)), bs)
+            gc.collect()
             try:
-                import gc
+                import torch
 
-                gc.collect()
+                torch.cuda.empty_cache()
             except Exception:
                 pass
+
+    words.sort(key=lambda w: (float(w["start_s"]), float(w["end_s"])))
+    segments = _group_segments(words, gap_s=float(settings.segment_gap_s))
+    full_text = " ".join(s["text"] for s in segments).strip()
+
+    transcription: Dict[str, Any] = {
+        "language": settings.language,
+        "language_probability": 1.0,
+        "duration_s": duration_s,
+        "segments": segments,
+        "chunking": {
+            "chunks": len(chunks),
+            "silence_cuts": len(cuts),
+            "max_chunk_s": float(settings.chunk_max_s),
+            "overlap_s": float(settings.chunk_overlap_s),
+        },
+    }
+    return transcription, full_text, int(bs)
 
 
 @app.post("/v1/transcribe")
@@ -757,12 +547,13 @@ async def transcribe(
     request: Request,
     file: UploadFile = File(...),
     language: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    word_timestamps: Optional[bool] = None,
+    # Accepted for backwards compatibility with Whisper-era clients; not used by the CTC decoder.
     beam_size: Optional[int] = None,
     patience: Optional[float] = None,
-    word_timestamps: Optional[bool] = None,
     log_prob_threshold: Optional[float] = None,
     no_speech_threshold: Optional[float] = None,
-    batch_size: Optional[int] = None,
     _=Depends(_require_internal_access),
 ) -> JSONResponse:
     filename = os.path.basename(file.filename or "") or "upload.m4a"
@@ -775,45 +566,53 @@ async def transcribe(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"upload failed: {e}")
 
-        lang = str(language) if language is not None else settings.language
-        b = int(beam_size) if beam_size is not None else int(settings.beam_size)
-        p = float(patience) if patience is not None else float(settings.patience)
-        wt = bool(word_timestamps) if word_timestamps is not None else bool(settings.word_timestamps)
-        lpt = float(log_prob_threshold) if log_prob_threshold is not None else settings.log_prob_threshold
-        nst = float(no_speech_threshold) if no_speech_threshold is not None else settings.no_speech_threshold
         bs = int(batch_size) if batch_size is not None else int(settings.batch_size)
+        lang = str(language) if language is not None else settings.language
 
         t0 = time.time()
-        async with _sem:
-            transcription, text, bs_used = await asyncio.to_thread(
-                _transcribe_file,
-                audio_path=path,
-                language=lang,
-                beam_size=b,
-                patience=p,
-                word_timestamps=wt,
-                log_prob_threshold=lpt,
-                no_speech_threshold=nst,
-                batch_size=bs,
-            )
+        try:
+            async with _sem:
+                transcription, text, bs_used = await asyncio.to_thread(
+                    _transcribe_file,
+                    audio_path=path,
+                    batch_size=bs,
+                )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         t_transcribe = time.time() - t0
+
+        transcription["language"] = lang
+        ignored = {
+            k: v
+            for k, v in {
+                "beam_size": beam_size,
+                "patience": patience,
+                "log_prob_threshold": log_prob_threshold,
+                "no_speech_threshold": no_speech_threshold,
+            }.items()
+            if v is not None
+        }
+        params: Dict[str, Any] = {
+            "model_id": settings.model_id,
+            "backend": "nemo-fastconformer",
+            "decoder_type": settings.decoder_type,
+            "language": lang,
+            "word_timestamps": True,
+            "batch_size": bs_used,
+            "chunk_max_s": float(settings.chunk_max_s),
+            "chunk_overlap_s": float(settings.chunk_overlap_s),
+        }
+        if word_timestamps is False:
+            params["word_timestamps_requested"] = False
+        if ignored:
+            params["ignored"] = ignored
 
         return JSONResponse(
             {
                 "input": {"filename": filename, "content_type": file.content_type},
                 "transcription": transcription,
                 "text": text,
-                "params": {
-                    "model_id": settings.model_id,
-                    "language": lang,
-                    "beam_size": b,
-                    "patience": p,
-                    "word_timestamps": wt,
-                    "log_prob_threshold": lpt,
-                    "no_speech_threshold": nst,
-                    "batch_size": bs_used,
-                    "temperature": 0.0,
-                },
+                "params": params,
                 "timing": {"transcribe_s": float(t_transcribe)},
             }
         )
